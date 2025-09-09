@@ -289,6 +289,7 @@ class SignalManager {
             const { action, symbol = config.DEFAULT_SYMBOL, percentage = config.DEFAULT_POSITION_SIZE } = signal;
             
             // Validate signal
+            console.log(signal)
             if (!['buy', 'sell'].includes(action)) {
                 logger.error('Invalid action:', action);
                 return { success: false, error: 'Invalid action' };
