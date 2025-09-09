@@ -250,6 +250,7 @@ class SignalManager {
     constructor() {
         this.cooldowns = new Map();
         this.dailyTrades = new Map();
+        this.lastAction = null; // Track last executed action
         this.okxClient = new OKXClient();
     }
 
@@ -311,6 +312,12 @@ class SignalManager {
                 return { success: false, error: 'Invalid action' };
             }
 
+            // Check if same action as last one
+            if (this.lastAction === action) {
+                logger.warn(`Skipping consecutive ${action} action`);
+                return { success: false, error: `Cannot execute consecutive ${action} actions` };
+            }
+
             // Check cooldown
             if (this.isInCooldown(symbol, action)) {
                 logger.warn(`Signal in cooldown: ${symbol} ${action}`);
@@ -323,12 +330,8 @@ class SignalManager {
                 return { success: false, error: 'Daily trade limit reached' };
             }
 
-            // Get account balance
+            // Get account balance (just to verify connection, no minimum check needed)
             const balance = await this.okxClient.getBalance('USDT');
-            if (!balance || balance.available < config.MIN_BALANCE_USDT) {
-                logger.error('Insufficient balance');
-                return { success: false, error: 'Insufficient balance' };
-            }
 
             // Calculate position size - use 100% of available balance
             let positionSize;
@@ -358,6 +361,7 @@ class SignalManager {
 
             if (order) {
                 this.setCooldown(symbol, action);
+                this.lastAction = action; // Remember this action
                 logger.info(`✅ Order executed: ${action} ${positionSize} ${symbol}`);
                 return { 
                     success: true, 
