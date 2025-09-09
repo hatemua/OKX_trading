@@ -286,10 +286,26 @@ class SignalManager {
     // Process trading signal
     async processSignal(signal) {
         try {
-            const { action, symbol = config.DEFAULT_SYMBOL, percentage = config.DEFAULT_POSITION_SIZE } = signal;
+            let { action, symbol = config.DEFAULT_SYMBOL, percentage = config.DEFAULT_POSITION_SIZE } = signal;
+            
+            // Parse action from trading strategy messages
+            console.log('Received signal:', signal);
+            
+            // If action contains a trading message, extract the actual buy/sell action
+            if (typeof action === 'string' && action.length > 10) {
+                if (action.toLowerCase().includes('order buy')) {
+                    action = 'buy';
+                } else if (action.toLowerCase().includes('order sell')) {
+                    action = 'sell';
+                } else {
+                    logger.error('Could not parse action from message:', action);
+                    return { success: false, error: 'Could not parse trading action from message' };
+                }
+            }
+            
+            console.log('Parsed action:', action);
             
             // Validate signal
-            console.log(signal)
             if (!['buy', 'sell'].includes(action)) {
                 logger.error('Invalid action:', action);
                 return { success: false, error: 'Invalid action' };
