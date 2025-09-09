@@ -11,7 +11,6 @@ dotenv.config();
 const config = {
     // Server Settings
     PORT: process.env.PORT || 3000,
-    WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || 'your-webhook-secret',
     
     // OKX API Settings
     OKX_API_KEY: process.env.OKX_API_KEY,
