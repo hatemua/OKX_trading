@@ -314,31 +314,21 @@ class SignalManager {
                 return { success: false, error: 'Insufficient balance' };
             }
 
-            // Calculate position size
+            // Calculate position size - use 100% of available balance
             let positionSize;
             if (action === 'buy') {
-                // Calculate USDT amount to spend
-                const usdtAmount = balance.available * (Math.min(percentage, config.MAX_POSITION_SIZE) / 100);
-                
-                // Get current price to calculate token amount
-                const ticker = await this.okxClient.getTicker(symbol);
-                if (!ticker) {
-                    return { success: false, error: 'Failed to get ticker price' };
-                }
-                
-                positionSize = (usdtAmount / ticker.last).toFixed(4);
+                // Use all available USDT for buying
+                positionSize = balance.available.toString();
             } else {
-                // For sell, get current position
-                const positions = await this.okxClient.getPositions(symbol);
-                if (!positions || positions.length === 0) {
-                    logger.warn('No position to sell');
-                    return { success: false, error: 'No position to sell' };
+                // For sell, get current SOL position and sell all of it
+                const solBalance = await this.okxClient.getBalance('SOL');
+                if (!solBalance || solBalance.available <= 0) {
+                    logger.warn('No SOL position to sell');
+                    return { success: false, error: 'No SOL position to sell' };
                 }
                 
-                // Sell percentage of position or all
-                const position = positions[0];
-                const availableAmount = parseFloat(position.availPos || position.pos);
-                positionSize = (availableAmount * (percentage / 100)).toFixed(4);
+                // Sell all available SOL
+                positionSize = solBalance.available.toString();
             }
 
             // Place order with stop loss and take profit
@@ -458,6 +448,57 @@ app.post('/manual/sell', async (req, res) => {
     
     const result = await signalManager.processSignal(signal);
     res.json(result);
+});
+
+// Test trade: Buy SOL with exactly 4 USDT
+app.post('/test/buy-sol', async (req, res) => {
+    try {
+        const okxClient = new OKXClient();
+        
+        // Get current SOL price
+        const ticker = await okxClient.getTicker('SOL-USDT');
+        if (!ticker) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Failed to get SOL price' 
+            });
+        }
+        
+        // Use USDT amount directly for market buy orders
+        const usdtAmount = 10;
+        
+        logger.info(`Test trade: Buying SOL with ${usdtAmount} USDT at price ${ticker.last}`);
+        
+        // Place market buy order using USDT amount
+        const order = await okxClient.placeMarketOrder('SOL-USDT', 'buy', usdtAmount.toString());
+        
+        if (order) {
+            res.json({
+                success: true,
+                message: `Successfully bought SOL with ${usdtAmount} USDT`,
+                details: {
+                    symbol: 'SOL-USDT',
+                    side: 'buy',
+                    usdtSpent: usdtAmount,
+                    price: ticker.last,
+                    orderId: order.ordId,
+                    timestamp: new Date().toISOString()
+                }
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: 'Order execution failed'
+            });
+        }
+        
+    } catch (error) {
+        logger.error('Test trade error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
 });
 
 // Get account info
