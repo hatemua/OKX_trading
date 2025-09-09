@@ -24,9 +24,9 @@ const config = {
         : 'https://www.okx.com',
     
     // Trading Settings
-    DEFAULT_SYMBOL: 'SOL-USDT',
-    DEFAULT_POSITION_SIZE: 10, // percentage of balance
-    MAX_POSITION_SIZE: 20, // maximum position size
+    TRADING_COIN: process.env.TRADING_COIN || 'DOGE',
+    DEFAULT_SYMBOL: `${process.env.TRADING_COIN || 'DOGE'}-USDT`,
+    BUY_AMOUNT_USDT: 1000, // Fixed amount for buying
     STOP_LOSS_PERCENTAGE: 2,
     TAKE_PROFIT_PERCENTAGE: 5,
     
@@ -333,21 +333,25 @@ class SignalManager {
             // Get account balance (just to verify connection, no minimum check needed)
             const balance = await this.okxClient.getBalance('USDT');
 
-            // Calculate position size - use 100% of available balance
+            // Calculate position size
             let positionSize;
             if (action === 'buy') {
-                // Use all available USDT for buying
-                positionSize = balance.available.toString();
+                // Use fixed 1000 USDT for buying
+                if (!balance || balance.available < config.BUY_AMOUNT_USDT) {
+                    logger.error(`Insufficient USDT balance. Need ${config.BUY_AMOUNT_USDT}, have ${balance?.available || 0}`);
+                    return { success: false, error: 'Insufficient USDT balance for trade' };
+                }
+                positionSize = config.BUY_AMOUNT_USDT.toString();
             } else {
-                // For sell, get current SOL position and sell all of it
-                const solBalance = await this.okxClient.getBalance('SOL');
-                if (!solBalance || solBalance.available <= 0) {
-                    logger.warn('No SOL position to sell');
-                    return { success: false, error: 'No SOL position to sell' };
+                // For sell, get current token position and sell all of it
+                const tokenBalance = await this.okxClient.getBalance(config.TRADING_COIN);
+                if (!tokenBalance || tokenBalance.available <= 0) {
+                    logger.warn(`No ${config.TRADING_COIN} position to sell`);
+                    return { success: false, error: `No ${config.TRADING_COIN} position to sell` };
                 }
                 
-                // Sell all available SOL
-                positionSize = solBalance.available.toString();
+                // Sell all available tokens
+                positionSize = tokenBalance.available.toString();
             }
 
             // Place order with stop loss and take profit
@@ -470,34 +474,34 @@ app.post('/manual/sell', async (req, res) => {
     res.json(result);
 });
 
-// Test trade: Buy SOL with exactly 4 USDT
-app.post('/test/buy-sol', async (req, res) => {
+// Test trade: Buy token with fixed USDT amount
+app.post('/test/buy-token', async (req, res) => {
     try {
         const okxClient = new OKXClient();
         
-        // Get current SOL price
-        const ticker = await okxClient.getTicker('SOL-USDT');
+        // Get current token price
+        const ticker = await okxClient.getTicker(config.DEFAULT_SYMBOL);
         if (!ticker) {
             return res.status(400).json({ 
                 success: false, 
-                error: 'Failed to get SOL price' 
+                error: `Failed to get ${config.TRADING_COIN} price` 
             });
         }
         
-        // Use USDT amount directly for market buy orders
+        // Use fixed USDT amount for market buy orders
         const usdtAmount = 10;
         
-        logger.info(`Test trade: Buying SOL with ${usdtAmount} USDT at price ${ticker.last}`);
+        logger.info(`Test trade: Buying ${config.TRADING_COIN} with ${usdtAmount} USDT at price ${ticker.last}`);
         
         // Place market buy order using USDT amount
-        const order = await okxClient.placeMarketOrder('SOL-USDT', 'buy', usdtAmount.toString());
+        const order = await okxClient.placeMarketOrder(config.DEFAULT_SYMBOL, 'buy', usdtAmount.toString());
         
         if (order) {
             res.json({
                 success: true,
-                message: `Successfully bought SOL with ${usdtAmount} USDT`,
+                message: `Successfully bought ${config.TRADING_COIN} with ${usdtAmount} USDT`,
                 details: {
-                    symbol: 'SOL-USDT',
+                    symbol: config.DEFAULT_SYMBOL,
                     side: 'buy',
                     usdtSpent: usdtAmount,
                     price: ticker.last,
