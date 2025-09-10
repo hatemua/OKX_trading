@@ -34,7 +34,7 @@ const config = {
     COOLDOWN_SECONDS: 60, // Prevent duplicate signals
     
     // Risk Management
-    MAX_DAILY_TRADES: 10,
+    MAX_DAILY_TRADES: 500,
     MIN_BALANCE_USDT: 50
 };
 
