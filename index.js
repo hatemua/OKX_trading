@@ -638,11 +638,16 @@ class SignalManager {
     // Process trading signal
     async processSignal(signal) {
         try {
-            // Convert all signal parameters to lowercase for consistency
+            // Convert all signal parameters to lowercase and handle N/A values
             const normalizedSignal = {};
             for (const [key, value] of Object.entries(signal)) {
                 if (typeof value === 'string') {
-                    normalizedSignal[key] = value.toLowerCase();
+                    // Convert "N/A" to null for easier handling
+                    if (value.toLowerCase() === 'n/a') {
+                        normalizedSignal[key] = null;
+                    } else {
+                        normalizedSignal[key] = value.toLowerCase();
+                    }
                 } else {
                     normalizedSignal[key] = value;
                 }
@@ -653,8 +658,6 @@ class SignalManager {
                 action,
                 symbol,
                 coin,
-                amount,
-                quantity,
                 recurringMode,
                 orderType,
                 price,
@@ -664,9 +667,20 @@ class SignalManager {
                 initialQuantity
             } = normalizedSignal;
             
-            // Auto-determine order type based on price
-            if (!orderType) {
+            // Convert null values to proper defaults or undefined
+            price = price || null;
+            initialAmount = initialAmount || null;
+            initialQuantity = initialQuantity || null;
+            
+            // Validate and set order type
+            if (!orderType || orderType === null) {
                 orderType = price ? 'limit' : 'market';
+            }
+            
+            // Validate orderType is either 'market' or 'limit'
+            if (!['market', 'limit'].includes(orderType)) {
+                logger.error(`Invalid orderType: ${orderType}. Must be 'market' or 'limit'`);
+                return { success: false, error: `Invalid orderType: ${orderType}. Must be 'market' or 'limit'` };
             }
             
             // Set default recurringMode if not provided
@@ -754,15 +768,6 @@ class SignalManager {
                         }
                         positionSize = tradingAmount.toString();
                         logger.info(`Buy mode: First trade with ${tradingAmount} USDT (initialAmount) - Strategy: ${strategyRef}`);
-                    } else if (amount) {
-                        // Fallback to regular amount
-                        tradingAmount = amount;
-                        if (!balance || balance.available < tradingAmount) {
-                            logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
-                            return { success: false, error: 'Insufficient USDT balance for trade' };
-                        }
-                        positionSize = tradingAmount.toString();
-                        logger.info(`Buy mode: First trade with ${tradingAmount} USDT (amount) - Strategy: ${strategyRef}`);
                     } else {
                         // Use default amount
                         tradingAmount = config.BUY_AMOUNT_USDT;
@@ -774,26 +779,14 @@ class SignalManager {
                         logger.info(`Buy mode: First trade with ${tradingAmount} USDT (default) - Strategy: ${strategyRef}`);
                     }
                 } else {
-                    // Subsequent trades
-                    if (recurringMode === 'qu' && amount) {
-                        // Quantity mode: use fixed USDT amount
-                        tradingAmount = amount;
-                        if (!balance || balance.available < tradingAmount) {
-                            logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
-                            return { success: false, error: 'Insufficient USDT balance for trade' };
-                        }
-                        positionSize = tradingAmount.toString();
-                        logger.info(`Buy mode (Qu): Fixed amount ${tradingAmount} USDT`);
-                    } else {
-                        // Amount mode: use stored balance from previous sell
-                        tradingAmount = await this.database.getTradingBalance(coin, category, subcategory);
-                        if (!balance || balance.available < tradingAmount) {
-                            logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
-                            return { success: false, error: 'Insufficient USDT balance for trade' };
-                        }
-                        positionSize = tradingAmount.toString();
-                        logger.info(`Buy mode (Am): Using ${tradingAmount} USDT from previous sell proceeds - Strategy: ${strategyRef}`);
+                    // Subsequent trades: use stored balance from previous sell
+                    tradingAmount = await this.database.getTradingBalance(coin, category, subcategory);
+                    if (!balance || balance.available < tradingAmount) {
+                        logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
+                        return { success: false, error: 'Insufficient USDT balance for trade' };
                     }
+                    positionSize = tradingAmount.toString();
+                    logger.info(`Buy mode: Using ${tradingAmount} USDT from previous sell proceeds - Strategy: ${strategyRef}`);
                 }
             } else {
                 // Sell logic
