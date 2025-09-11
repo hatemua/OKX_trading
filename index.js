@@ -458,6 +458,50 @@ class OKXClient {
             return [];
         }
     }
+
+    // Validate if symbol exists on OKX
+    async validateSymbol(symbol) {
+        try {
+            // Try the symbol as provided first
+            let result = await this.request('GET', '/api/v5/public/instruments', { 
+                instType: 'SPOT',
+                instId: symbol 
+            });
+            
+            if (result.code === '0' && result.data && result.data.length > 0) {
+                logger.info(`Symbol ${symbol} is valid on OKX`);
+                return true;
+            }
+            
+            // If not found, try alternative formats
+            const alternatives = [
+                symbol.replace('-', ''),    // SOL-USDT → SOLUSDT
+                symbol.replace('-', '_'),   // SOL-USDT → SOL_USDT
+                symbol.replace('-USDT', '-USD'),  // SOL-USDT → SOL-USD
+            ];
+            
+            for (const alt of alternatives) {
+                if (alt !== symbol) {
+                    result = await this.request('GET', '/api/v5/public/instruments', { 
+                        instType: 'SPOT',
+                        instId: alt 
+                    });
+                    
+                    if (result.code === '0' && result.data && result.data.length > 0) {
+                        logger.info(`Symbol found with alternative format: ${alt} (original: ${symbol})`);
+                        return true;
+                    }
+                }
+            }
+            
+            logger.error(`Symbol ${symbol} not found on OKX (tried alternatives too)`);
+            return false;
+            
+        } catch (error) {
+            logger.error(`Error validating symbol ${symbol}:`, error);
+            return false;
+        }
+    }
 }
 
 // === TRADINGVIEW MESSAGE PARSER ===
@@ -476,7 +520,14 @@ class TradingViewParser {
                     switch (key.toLowerCase().trim()) {
                         case 'coin':
                             // Handle format like "Sol;usdt" or "Sol-usdt"
-                            const coinPair = value.replace(/[;-]/g, '-').toUpperCase();
+                            let coinPair = value.replace(/[;]/g, '-').toUpperCase();
+                            
+                            // Ensure proper OKX format (BASE-QUOTE)
+                            if (!coinPair.includes('-')) {
+                                // If no separator, assume it's just the base coin, add USDT
+                                coinPair = `${coinPair}-USDT`;
+                            }
+                            
                             parsed.symbol = coinPair;
                             // Extract base coin (e.g., "SOL" from "SOL-USDT")
                             parsed.coin = coinPair.split('-')[0];
@@ -626,6 +677,13 @@ class SignalManager {
             if (!symbol || !coin) {
                 logger.error('Missing coin or symbol:', { symbol, coin });
                 return { success: false, error: 'Missing coin or symbol information' };
+            }
+
+            // Validate that the symbol exists on OKX
+            const symbolValid = await this.okxClient.validateSymbol(symbol);
+            if (!symbolValid) {
+                logger.error(`Invalid symbol: ${symbol}`);
+                return { success: false, error: `Symbol ${symbol} not available on OKX` };
             }
 
             // Check Redis database for buy/sell eligibility using strategy reference
