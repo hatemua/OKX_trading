@@ -556,6 +556,12 @@ class TradingViewParser {
                         case 'price':
                             parsed.price = parseFloat(value) || null;
                             break;
+                        case 'initialamount':
+                            parsed.initialAmount = parseFloat(value) || null;
+                            break;
+                        case 'initialquantity':
+                            parsed.initialQuantity = parseFloat(value) || null;
+                            break;
                     }
                 }
             }
@@ -650,11 +656,18 @@ class SignalManager {
                 amount,
                 quantity,
                 recurringMode,
-                orderType = 'market',
+                orderType,
                 price,
                 category,
-                subcategory
+                subcategory,
+                initialAmount,
+                initialQuantity
             } = normalizedSignal;
+            
+            // Auto-determine order type based on price
+            if (!orderType) {
+                orderType = price ? 'limit' : 'market';
+            }
             
             // Set default recurringMode if not provided
             if (!recurringMode || !['am', 'qu'].includes(recurringMode)) {
@@ -721,56 +734,99 @@ class SignalManager {
             let tradingAmount;
             
             if (action === 'buy') {
-                if (recurringMode === 'qu' && amount) {
-                    // Quantity mode (Qu): Use fixed USDT amount for buying
-                    tradingAmount = amount;
-                    if (!balance || balance.available < tradingAmount) {
-                        logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
-                        return { success: false, error: 'Insufficient USDT balance for trade' };
-                    }
-                    positionSize = tradingAmount.toString();
-                    logger.info(`Buy mode (Qu): Fixed amount ${tradingAmount} USDT`);
-                } else {
-                    // Amount mode (Am): Check if this is the first trade for this strategy
-                    const isFirstTrade = await this.database.isFirstTrade(coin, category, subcategory);
-                    
-                    if (isFirstTrade && amount) {
-                        // First trade: use amount from signal
+                const isFirstTrade = await this.database.isFirstTrade(coin, category, subcategory);
+                
+                if (isFirstTrade) {
+                    // First trade: use initial parameters if provided
+                    if (initialQuantity) {
+                        // Buy specific token quantity
+                        positionSize = initialQuantity.toString();
+                        logger.info(`Buy mode: First trade with ${initialQuantity} ${coin} (initialQuantity) - Strategy: ${strategyRef}`);
+                    } else if (initialAmount) {
+                        // Buy with specific USDT amount
+                        tradingAmount = initialAmount;
+                        if (!balance || balance.available < tradingAmount) {
+                            logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
+                            return { success: false, error: 'Insufficient USDT balance for trade' };
+                        }
+                        positionSize = tradingAmount.toString();
+                        logger.info(`Buy mode: First trade with ${tradingAmount} USDT (initialAmount) - Strategy: ${strategyRef}`);
+                    } else if (amount) {
+                        // Fallback to regular amount
                         tradingAmount = amount;
-                        logger.info(`Buy mode (Am): First trade with ${tradingAmount} USDT from signal - Strategy: ${strategyRef}`);
+                        if (!balance || balance.available < tradingAmount) {
+                            logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
+                            return { success: false, error: 'Insufficient USDT balance for trade' };
+                        }
+                        positionSize = tradingAmount.toString();
+                        logger.info(`Buy mode: First trade with ${tradingAmount} USDT (amount) - Strategy: ${strategyRef}`);
                     } else {
-                        // Subsequent buys: use stored balance from previous sell
+                        // Use default amount
+                        tradingAmount = config.BUY_AMOUNT_USDT;
+                        if (!balance || balance.available < tradingAmount) {
+                            logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
+                            return { success: false, error: 'Insufficient USDT balance for trade' };
+                        }
+                        positionSize = tradingAmount.toString();
+                        logger.info(`Buy mode: First trade with ${tradingAmount} USDT (default) - Strategy: ${strategyRef}`);
+                    }
+                } else {
+                    // Subsequent trades
+                    if (recurringMode === 'qu' && amount) {
+                        // Quantity mode: use fixed USDT amount
+                        tradingAmount = amount;
+                        if (!balance || balance.available < tradingAmount) {
+                            logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
+                            return { success: false, error: 'Insufficient USDT balance for trade' };
+                        }
+                        positionSize = tradingAmount.toString();
+                        logger.info(`Buy mode (Qu): Fixed amount ${tradingAmount} USDT`);
+                    } else {
+                        // Amount mode: use stored balance from previous sell
                         tradingAmount = await this.database.getTradingBalance(coin, category, subcategory);
+                        if (!balance || balance.available < tradingAmount) {
+                            logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
+                            return { success: false, error: 'Insufficient USDT balance for trade' };
+                        }
+                        positionSize = tradingAmount.toString();
                         logger.info(`Buy mode (Am): Using ${tradingAmount} USDT from previous sell proceeds - Strategy: ${strategyRef}`);
                     }
-                    
-                    if (!balance || balance.available < tradingAmount) {
-                        logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
-                        return { success: false, error: 'Insufficient USDT balance for trade' };
-                    }
-                    positionSize = tradingAmount.toString();
                 }
             } else {
                 // Sell logic
                 const buyPosition = await this.database.getBuyPosition(coin, category, subcategory);
+                const isFirstTrade = await this.database.isFirstTrade(coin, category, subcategory);
                 
-                // For Am mode, check if it's the first trade and prevent sell
-                if (recurringMode === 'am') {
-                    const isFirstTrade = await this.database.isFirstTrade(coin, category, subcategory);
-                    if (isFirstTrade) {
-                        logger.warn(`Cannot sell on first trade for Am mode - Strategy: ${strategyRef}`);
+                if (isFirstTrade) {
+                    // First sell: use initial parameters if provided
+                    if (initialQuantity) {
+                        // Sell specific token quantity
+                        positionSize = initialQuantity.toString();
+                        logger.info(`Sell mode: First trade selling ${initialQuantity} ${coin} (initialQuantity) - Strategy: ${strategyRef}`);
+                    } else if (recurringMode === 'am') {
+                        // For Am mode, prevent selling on first trade if no initial parameters
+                        logger.warn(`Cannot sell on first trade for Am mode without position - Strategy: ${strategyRef}`);
                         return { success: false, error: `Cannot sell on first trade for Am mode. Must buy first - Strategy: ${strategyRef}` };
+                    } else {
+                        // For other modes, check if there's a position to sell
+                        if (!buyPosition) {
+                            logger.warn(`No buy position found for first sell - Strategy: ${strategyRef}`);
+                            return { success: false, error: `No buy position to sell for strategy: ${strategyRef}` };
+                        }
+                        positionSize = buyPosition.quantity.toString();
+                        logger.info(`Sell mode: First trade selling ${positionSize} ${coin} (from position) - Strategy: ${strategyRef}`);
                     }
+                } else {
+                    // Subsequent sells: use existing position
+                    if (!buyPosition) {
+                        logger.warn(`No buy position found for strategy: ${strategyRef}`);
+                        return { success: false, error: `No buy position to sell for strategy: ${strategyRef}` };
+                    }
+                    
+                    // Both Qu and Am modes: sell the quantity that was bought
+                    positionSize = buyPosition.quantity.toString();
+                    logger.info(`Sell mode: Selling ${positionSize} ${coin} (strategy: ${strategyRef})`);
                 }
-                
-                if (!buyPosition) {
-                    logger.warn(`No buy position found for strategy: ${strategyRef}`);
-                    return { success: false, error: `No buy position to sell for strategy: ${strategyRef}` };
-                }
-                
-                // Both Qu and Am modes: sell the quantity that was bought
-                positionSize = buyPosition.quantity.toString();
-                logger.info(`Sell mode: Selling ${positionSize} ${coin} (strategy: ${strategyRef})`);
             }
 
             // Place order based on order type
@@ -790,9 +846,17 @@ class SignalManager {
                     const ticker = await this.okxClient.getTicker(symbol);
                     const purchasePrice = ticker ? ticker.last : (price || 0);
                     
-                    // Calculate quantity bought based on USDT amount spent
-                    const amountSpent = tradingAmount;
-                    const quantityBought = purchasePrice > 0 ? (amountSpent / purchasePrice) : 0;
+                    let quantityBought, amountSpent;
+                    
+                    if (initialQuantity) {
+                        // When buying by quantity, calculate amount spent
+                        quantityBought = initialQuantity;
+                        amountSpent = quantityBought * purchasePrice;
+                    } else {
+                        // When buying by amount, calculate quantity bought
+                        amountSpent = tradingAmount;
+                        quantityBought = purchasePrice > 0 ? (amountSpent / purchasePrice) : 0;
+                    }
                     
                     await this.database.storeBuyOrder(
                         coin,
