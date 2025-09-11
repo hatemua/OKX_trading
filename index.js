@@ -1091,6 +1091,36 @@ app.get('/account', async (req, res) => {
     }
 });
 
+// Test webhook with JSON (for testing purposes)
+app.post('/test/webhook', async (req, res) => {
+    try {
+        logger.info('Test webhook received:', req.body);
+        
+        // Process the signal directly
+        const result = await signalManager.processSignal(req.body);
+        
+        if (result.success) {
+            res.json({ 
+                success: true, 
+                message: 'Test signal processed successfully',
+                details: result.details 
+            });
+        } else {
+            res.status(400).json({ 
+                success: false, 
+                error: result.error 
+            });
+        }
+
+    } catch (error) {
+        logger.error('Test webhook error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
 // Get current position from Redis by strategy
 app.get('/position/:coin/:category/:subcategory', async (req, res) => {
     try {
