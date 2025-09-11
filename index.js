@@ -674,9 +674,12 @@ class SignalManager {
                 recurringMode = 'am'; // Default to amount mode
             }
             
-            // Convert coin back to uppercase for consistency
+            // Convert coin and symbol back to uppercase for consistency
             if (coin) {
                 coin = coin.toUpperCase();
+            }
+            if (symbol) {
+                symbol = symbol.toUpperCase();
             }
             
             logger.info('Processing signal:', signal);
