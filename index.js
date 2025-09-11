@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const dotenv = require('dotenv');
 const winston = require('winston');
+const redis = require('redis');
 
 dotenv.config();
 
@@ -35,7 +36,12 @@ const config = {
     
     // Risk Management
     MAX_DAILY_TRADES: 500,
-    MIN_BALANCE_USDT: 50
+    MIN_BALANCE_USDT: 50,
+    
+    // Redis Settings
+    REDIS_HOST: process.env.REDIS_HOST || 'localhost',
+    REDIS_PORT: process.env.REDIS_PORT || 6379,
+    REDIS_PASSWORD: process.env.REDIS_PASSWORD || null
 };
 
 // === LOGGER SETUP ===
@@ -53,6 +59,152 @@ const logger = winston.createLogger({
         })
     ]
 });
+
+// === REDIS DATABASE ===
+class TradeDatabase {
+    constructor() {
+        this.client = redis.createClient({
+            host: config.REDIS_HOST,
+            port: config.REDIS_PORT,
+            password: config.REDIS_PASSWORD || undefined,
+            retry_strategy: (options) => {
+                if (options.error && options.error.code === 'ECONNREFUSED') {
+                    logger.error('Redis connection refused');
+                    return new Error('Redis connection refused');
+                }
+                if (options.total_retry_time > 1000 * 60 * 60) {
+                    return new Error('Retry time exhausted');
+                }
+                return Math.min(options.attempt * 100, 3000);
+            }
+        });
+        
+        this.client.on('error', (err) => {
+            logger.error('Redis Client Error:', err);
+        });
+        
+        this.client.on('connect', () => {
+            logger.info('Connected to Redis');
+        });
+    }
+
+    async connect() {
+        try {
+            await this.client.connect();
+            logger.info('Redis database connected successfully');
+        } catch (error) {
+            logger.error('Failed to connect to Redis:', error);
+            throw error;
+        }
+    }
+
+    // Store a buy order
+    async storeBuyOrder(coin, quantity, price, usdtSpent, orderId, timestamp) {
+        const key = `buy:${coin}`;
+        const orderData = {
+            quantity: quantity.toString(),
+            price: price.toString(),
+            usdtSpent: usdtSpent.toString(),
+            orderId: orderId,
+            timestamp: timestamp,
+            status: 'active'
+        };
+        
+        try {
+            await this.client.hSet(key, orderData);
+            logger.info(`Stored buy order: ${quantity} ${coin} at ${price} (spent ${usdtSpent} USDT)`);
+            return true;
+        } catch (error) {
+            logger.error('Error storing buy order:', error);
+            return false;
+        }
+    }
+
+    // Get current buy position
+    async getBuyPosition(coin) {
+        const key = `buy:${coin}`;
+        try {
+            const data = await this.client.hGetAll(key);
+            if (Object.keys(data).length === 0) {
+                return null;
+            }
+            return {
+                quantity: parseFloat(data.quantity),
+                price: parseFloat(data.price),
+                usdtSpent: parseFloat(data.usdtSpent),
+                orderId: data.orderId,
+                timestamp: data.timestamp,
+                status: data.status
+            };
+        } catch (error) {
+            logger.error('Error getting buy position:', error);
+            return null;
+        }
+    }
+
+    // Clear buy position (after selling)
+    async clearBuyPosition(coin) {
+        const key = `buy:${coin}`;
+        try {
+            await this.client.del(key);
+            logger.info(`Cleared buy position for ${coin}`);
+            return true;
+        } catch (error) {
+            logger.error('Error clearing buy position:', error);
+            return false;
+        }
+    }
+
+    // Check if we can buy (no active position)
+    async canBuy(coin) {
+        const position = await this.getBuyPosition(coin);
+        return position === null || position.status !== 'active';
+    }
+
+    // Check if we can sell (have active position)
+    async canSell(coin) {
+        const position = await this.getBuyPosition(coin);
+        return position !== null && position.status === 'active' && position.quantity > 0;
+    }
+
+    // Store trading balance (proceeds from sells, or initial amount)
+    async storeTradingBalance(coin, usdtAmount) {
+        const key = `balance:${coin}`;
+        try {
+            await this.client.set(key, usdtAmount.toString());
+            logger.info(`Stored trading balance: ${usdtAmount} USDT for ${coin}`);
+            return true;
+        } catch (error) {
+            logger.error('Error storing trading balance:', error);
+            return false;
+        }
+    }
+
+    // Get trading balance (amount to use for next buy)
+    async getTradingBalance(coin) {
+        const key = `balance:${coin}`;
+        try {
+            const balance = await this.client.get(key);
+            if (!balance) {
+                // If no balance stored, use default amount
+                return config.BUY_AMOUNT_USDT;
+            }
+            return parseFloat(balance);
+        } catch (error) {
+            logger.error('Error getting trading balance:', error);
+            return config.BUY_AMOUNT_USDT;
+        }
+    }
+
+    async disconnect() {
+        try {
+            await this.client.disconnect();
+            logger.info('Redis database disconnected');
+        } catch (error) {
+            logger.error('Error disconnecting from Redis:', error);
+        }
+    }
+}
 
 // === OKX API CLIENT ===
 class OKXClient {
@@ -252,6 +404,17 @@ class SignalManager {
         this.dailyTrades = new Map();
         this.lastAction = null; // Track last executed action
         this.okxClient = new OKXClient();
+        this.database = new TradeDatabase();
+    }
+
+    async initialize() {
+        try {
+            await this.database.connect();
+            logger.info('SignalManager initialized with Redis database');
+        } catch (error) {
+            logger.error('Failed to initialize SignalManager:', error);
+            throw error;
+        }
     }
 
     // Check if signal is in cooldown
@@ -312,10 +475,18 @@ class SignalManager {
                 return { success: false, error: 'Invalid action' };
             }
 
-            // Check if same action as last one
-            if (this.lastAction === action) {
-                logger.warn(`Skipping consecutive ${action} action`);
-                return { success: false, error: `Cannot execute consecutive ${action} actions` };
+            // Check Redis database for buy/sell eligibility
+            const canBuy = await this.database.canBuy(config.TRADING_COIN);
+            const canSell = await this.database.canSell(config.TRADING_COIN);
+            
+            if (action === 'buy' && !canBuy) {
+                logger.warn(`Cannot buy ${config.TRADING_COIN} - already have active position`);
+                return { success: false, error: `Already have active ${config.TRADING_COIN} position` };
+            }
+            
+            if (action === 'sell' && !canSell) {
+                logger.warn(`Cannot sell ${config.TRADING_COIN} - no active position to sell`);
+                return { success: false, error: `No active ${config.TRADING_COIN} position to sell` };
             }
 
             // Check cooldown
@@ -335,23 +506,29 @@ class SignalManager {
 
             // Calculate position size
             let positionSize;
+            let tradingAmount;
+            
             if (action === 'buy') {
-                // Use fixed 1000 USDT for buying
-                if (!balance || balance.available < config.BUY_AMOUNT_USDT) {
-                    logger.error(`Insufficient USDT balance. Need ${config.BUY_AMOUNT_USDT}, have ${balance?.available || 0}`);
+                // Get available trading balance (from previous sell or initial amount)
+                tradingAmount = await this.database.getTradingBalance(config.TRADING_COIN);
+                
+                if (!balance || balance.available < tradingAmount) {
+                    logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
                     return { success: false, error: 'Insufficient USDT balance for trade' };
                 }
-                positionSize = config.BUY_AMOUNT_USDT.toString();
+                positionSize = tradingAmount.toString();
+                logger.info(`Using ${tradingAmount} USDT for buy order`);
             } else {
-                // For sell, get current token position and sell all of it
-                const tokenBalance = await this.okxClient.getBalance(config.TRADING_COIN);
-                if (!tokenBalance || tokenBalance.available <= 0) {
-                    logger.warn(`No ${config.TRADING_COIN} position to sell`);
-                    return { success: false, error: `No ${config.TRADING_COIN} position to sell` };
+                // For sell, get the quantity from Redis (what we bought)
+                const buyPosition = await this.database.getBuyPosition(config.TRADING_COIN);
+                if (!buyPosition) {
+                    logger.warn(`No buy position found in database for ${config.TRADING_COIN}`);
+                    return { success: false, error: `No buy position to sell` };
                 }
                 
-                // Sell all available tokens
-                positionSize = tokenBalance.available.toString();
+                // Sell the exact quantity we bought
+                positionSize = buyPosition.quantity.toString();
+                logger.info(`Selling ${positionSize} ${config.TRADING_COIN}`);
             }
 
             // Place order with stop loss and take profit
@@ -366,6 +543,40 @@ class SignalManager {
             if (order) {
                 this.setCooldown(symbol, action);
                 this.lastAction = action; // Remember this action
+                
+                // Update Redis database
+                if (action === 'buy') {
+                    // Get ticker to store the purchase price
+                    const ticker = await this.okxClient.getTicker(symbol);
+                    const purchasePrice = ticker ? ticker.last : 0;
+                    
+                    // Calculate quantity bought (approximate, since we're using USDT amount)
+                    const quantityBought = purchasePrice > 0 ? (parseFloat(positionSize) / purchasePrice) : 0;
+                    
+                    await this.database.storeBuyOrder(
+                        config.TRADING_COIN,
+                        quantityBought,
+                        purchasePrice,
+                        tradingAmount,
+                        order.ordId,
+                        new Date().toISOString()
+                    );
+                } else {
+                    // Calculate proceeds from sell
+                    const ticker = await this.okxClient.getTicker(symbol);
+                    const currentPrice = ticker ? ticker.last : 0;
+                    const soldQuantity = parseFloat(positionSize);
+                    const sellProceeds = currentPrice * soldQuantity;
+                    
+                    // Store new trading balance for next buy
+                    await this.database.storeTradingBalance(config.TRADING_COIN, sellProceeds);
+                    
+                    // Clear buy position after selling
+                    await this.database.clearBuyPosition(config.TRADING_COIN);
+                    
+                    logger.info(`Sell proceeds: ${sellProceeds.toFixed(2)} USDT (will be used for next buy)`);
+                }
+                
                 logger.info(`✅ Order executed: ${action} ${positionSize} ${symbol}`);
                 return { 
                     success: true, 
@@ -394,6 +605,16 @@ app.use(express.json());
 app.use(express.text());
 
 const signalManager = new SignalManager();
+
+// Initialize SignalManager with Redis
+(async () => {
+    try {
+        await signalManager.initialize();
+    } catch (error) {
+        logger.error('Failed to initialize application:', error);
+        process.exit(1);
+    }
+})();
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -535,6 +756,27 @@ app.get('/account', async (req, res) => {
         res.json({
             balance,
             positions,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get current position from Redis
+app.get('/position', async (req, res) => {
+    try {
+        const buyPosition = await signalManager.database.getBuyPosition(config.TRADING_COIN);
+        const canBuy = await signalManager.database.canBuy(config.TRADING_COIN);
+        const canSell = await signalManager.database.canSell(config.TRADING_COIN);
+        const tradingBalance = await signalManager.database.getTradingBalance(config.TRADING_COIN);
+        
+        res.json({
+            coin: config.TRADING_COIN,
+            buyPosition,
+            canBuy,
+            canSell,
+            tradingBalance: `${tradingBalance} USDT`,
             timestamp: new Date().toISOString()
         });
     } catch (error) {
