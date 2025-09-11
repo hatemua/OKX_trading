@@ -98,21 +98,30 @@ class TradeDatabase {
         }
     }
 
-    // Store a buy order
-    async storeBuyOrder(coin, quantity, price, usdtSpent, orderId, timestamp) {
-        const key = `buy:${coin}`;
+    // Create strategy reference key
+    getStrategyKey(coin, category, subcategory) {
+        return `${coin}:${category}:${subcategory}`;
+    }
+
+    // Store a buy order with strategy reference
+    async storeBuyOrder(coin, category, subcategory, quantity, price, usdtSpent, orderId, timestamp) {
+        const strategyRef = this.getStrategyKey(coin, category, subcategory);
+        const key = `buy:${strategyRef}`;
         const orderData = {
             quantity: quantity.toString(),
             price: price.toString(),
             usdtSpent: usdtSpent.toString(),
             orderId: orderId,
             timestamp: timestamp,
-            status: 'active'
+            status: 'active',
+            coin: coin,
+            category: category,
+            subcategory: subcategory
         };
         
         try {
             await this.client.hSet(key, orderData);
-            logger.info(`Stored buy order: ${quantity} ${coin} at ${price} (spent ${usdtSpent} USDT)`);
+            logger.info(`Stored buy order: ${quantity} ${coin} at ${price} (spent ${usdtSpent} USDT) - Strategy: ${strategyRef}`);
             return true;
         } catch (error) {
             logger.error('Error storing buy order:', error);
@@ -120,9 +129,10 @@ class TradeDatabase {
         }
     }
 
-    // Get current buy position
-    async getBuyPosition(coin) {
-        const key = `buy:${coin}`;
+    // Get current buy position by strategy reference
+    async getBuyPosition(coin, category, subcategory) {
+        const strategyRef = this.getStrategyKey(coin, category, subcategory);
+        const key = `buy:${strategyRef}`;
         try {
             const data = await this.client.hGetAll(key);
             if (Object.keys(data).length === 0) {
@@ -134,7 +144,11 @@ class TradeDatabase {
                 usdtSpent: parseFloat(data.usdtSpent),
                 orderId: data.orderId,
                 timestamp: data.timestamp,
-                status: data.status
+                status: data.status,
+                coin: data.coin,
+                category: data.category,
+                subcategory: data.subcategory,
+                strategyRef: strategyRef
             };
         } catch (error) {
             logger.error('Error getting buy position:', error);
@@ -143,11 +157,12 @@ class TradeDatabase {
     }
 
     // Clear buy position (after selling)
-    async clearBuyPosition(coin) {
-        const key = `buy:${coin}`;
+    async clearBuyPosition(coin, category, subcategory) {
+        const strategyRef = this.getStrategyKey(coin, category, subcategory);
+        const key = `buy:${strategyRef}`;
         try {
             await this.client.del(key);
-            logger.info(`Cleared buy position for ${coin}`);
+            logger.info(`Cleared buy position for strategy: ${strategyRef}`);
             return true;
         } catch (error) {
             logger.error('Error clearing buy position:', error);
@@ -156,23 +171,24 @@ class TradeDatabase {
     }
 
     // Check if we can buy (no active position)
-    async canBuy(coin) {
-        const position = await this.getBuyPosition(coin);
+    async canBuy(coin, category, subcategory) {
+        const position = await this.getBuyPosition(coin, category, subcategory);
         return position === null || position.status !== 'active';
     }
 
     // Check if we can sell (have active position)
-    async canSell(coin) {
-        const position = await this.getBuyPosition(coin);
+    async canSell(coin, category, subcategory) {
+        const position = await this.getBuyPosition(coin, category, subcategory);
         return position !== null && position.status === 'active' && position.quantity > 0;
     }
 
-    // Store trading balance (proceeds from sells, or initial amount)
-    async storeTradingBalance(coin, usdtAmount) {
-        const key = `balance:${coin}`;
+    // Store trading balance (proceeds from sells, or initial amount) by strategy
+    async storeTradingBalance(coin, category, subcategory, usdtAmount) {
+        const strategyRef = this.getStrategyKey(coin, category, subcategory);
+        const key = `balance:${strategyRef}`;
         try {
             await this.client.set(key, usdtAmount.toString());
-            logger.info(`Stored trading balance: ${usdtAmount} USDT for ${coin}`);
+            logger.info(`Stored trading balance: ${usdtAmount} USDT for strategy: ${strategyRef}`);
             return true;
         } catch (error) {
             logger.error('Error storing trading balance:', error);
@@ -180,9 +196,10 @@ class TradeDatabase {
         }
     }
 
-    // Get trading balance (amount to use for next buy)
-    async getTradingBalance(coin) {
-        const key = `balance:${coin}`;
+    // Get trading balance (amount to use for next buy) by strategy
+    async getTradingBalance(coin, category, subcategory) {
+        const strategyRef = this.getStrategyKey(coin, category, subcategory);
+        const key = `balance:${strategyRef}`;
         try {
             const balance = await this.client.get(key);
             if (!balance) {
@@ -193,6 +210,25 @@ class TradeDatabase {
         } catch (error) {
             logger.error('Error getting trading balance:', error);
             return config.BUY_AMOUNT_USDT;
+        }
+    }
+
+    // Check if this is the first trade for this strategy reference
+    async isFirstTrade(coin, category, subcategory) {
+        const strategyRef = this.getStrategyKey(coin, category, subcategory);
+        const balanceKey = `balance:${strategyRef}`;
+        const positionKey = `buy:${strategyRef}`;
+        
+        try {
+            // Check if we have any stored balance or position for this strategy
+            const balance = await this.client.get(balanceKey);
+            const position = await this.client.hGetAll(positionKey);
+            
+            // It's the first trade if neither balance nor position exists
+            return !balance && Object.keys(position).length === 0;
+        } catch (error) {
+            logger.error('Error checking first trade:', error);
+            return true; // Assume first trade if error
         }
     }
 
@@ -301,7 +337,7 @@ class OKXClient {
             const result = await this.request('POST', '/api/v5/trade/order', null, orderData);
             
             if (result.code === '0') {
-                logger.info(`Order placed successfully: ${side} ${amount} ${symbol}`);
+                logger.info(`Market order placed successfully: ${side} ${amount} ${symbol}`);
                 return result.data[0];
             } else {
                 logger.error('Order failed:', result);
@@ -309,6 +345,33 @@ class OKXClient {
             }
         } catch (error) {
             logger.error('Error placing order:', error);
+            return null;
+        }
+    }
+
+    // Place limit order
+    async placeLimitOrder(symbol, side, amount, price) {
+        try {
+            const orderData = {
+                instId: symbol,
+                tdMode: 'cash', // Spot trading
+                side: side, // 'buy' or 'sell'
+                ordType: 'limit',
+                sz: amount.toString(),
+                px: price.toString()
+            };
+
+            const result = await this.request('POST', '/api/v5/trade/order', null, orderData);
+            
+            if (result.code === '0') {
+                logger.info(`Limit order placed successfully: ${side} ${amount} ${symbol} at ${price}`);
+                return result.data[0];
+            } else {
+                logger.error('Limit order failed:', result);
+                return null;
+            }
+        } catch (error) {
+            logger.error('Error placing limit order:', error);
             return null;
         }
     }
@@ -397,6 +460,74 @@ class OKXClient {
     }
 }
 
+// === TRADINGVIEW MESSAGE PARSER ===
+class TradingViewParser {
+    static parseMessage(message) {
+        try {
+            // Parse TradingView webhook format
+            const lines = message.split('\n').map(line => line.trim()).filter(line => line);
+            const parsed = {};
+            
+            for (const line of lines) {
+                if (line.includes(':')) {
+                    const [key, ...valueParts] = line.split(':');
+                    const value = valueParts.join(':').trim();
+                    
+                    switch (key.toLowerCase().trim()) {
+                        case 'coin':
+                            // Handle format like "Sol;usdt" or "Sol-usdt"
+                            const coinPair = value.replace(/[;-]/g, '-').toUpperCase();
+                            parsed.symbol = coinPair;
+                            // Extract base coin (e.g., "SOL" from "SOL-USDT")
+                            parsed.coin = coinPair.split('-')[0];
+                            break;
+                        case 'cat':
+                            parsed.category = value;
+                            break;
+                        case 'scat':
+                            parsed.subcategory = value;
+                            break;
+                        case 'action':
+                            parsed.action = value.toLowerCase();
+                            break;
+                        case 'quantity':
+                            parsed.quantity = parseFloat(value) || null;
+                            break;
+                        case 'amount':
+                            parsed.amount = parseFloat(value) || null;
+                            break;
+                        case 'recurringmode':
+                            parsed.recurringMode = value.toLowerCase();
+                            break;
+                        case 'ordertype':
+                            parsed.orderType = value.toLowerCase();
+                            break;
+                        case 'price':
+                            parsed.price = parseFloat(value) || null;
+                            break;
+                    }
+                }
+            }
+            
+            // Validate required fields
+            if (!parsed.action || !['buy', 'sell'].includes(parsed.action)) {
+                throw new Error('Invalid or missing action');
+            }
+            
+            if (!parsed.symbol) {
+                throw new Error('Missing coin pair');
+            }
+            
+            logger.info('Parsed TradingView message:', parsed);
+            return parsed;
+            
+        } catch (error) {
+            logger.error('Error parsing TradingView message:', error);
+            throw error;
+        }
+    }
+}
+
 // === SIGNAL MANAGER ===
 class SignalManager {
     constructor() {
@@ -450,43 +581,66 @@ class SignalManager {
     // Process trading signal
     async processSignal(signal) {
         try {
-            let { action, symbol = config.DEFAULT_SYMBOL, percentage = config.DEFAULT_POSITION_SIZE } = signal;
-            
-            // Parse action from trading strategy messages
-            console.log('Received signal:', signal);
-            
-            // If action contains a trading message, extract the actual buy/sell action
-            if (typeof action === 'string' && action.length > 10) {
-                if (action.toLowerCase().includes('order buy')) {
-                    action = 'buy';
-                } else if (action.toLowerCase().includes('order sell')) {
-                    action = 'sell';
+            // Convert all signal parameters to lowercase for consistency
+            const normalizedSignal = {};
+            for (const [key, value] of Object.entries(signal)) {
+                if (typeof value === 'string') {
+                    normalizedSignal[key] = value.toLowerCase();
                 } else {
-                    logger.error('Could not parse action from message:', action);
-                    return { success: false, error: 'Could not parse trading action from message' };
+                    normalizedSignal[key] = value;
                 }
             }
             
-            console.log('Parsed action:', action);
+            // Extract parameters from normalized signal
+            let {
+                action,
+                symbol,
+                coin,
+                amount,
+                quantity,
+                recurringMode,
+                orderType = 'market',
+                price,
+                category,
+                subcategory
+            } = normalizedSignal;
+            
+            // Set default recurringMode if not provided
+            if (!recurringMode || !['am', 'qu'].includes(recurringMode)) {
+                recurringMode = 'am'; // Default to amount mode
+            }
+            
+            // Convert coin back to uppercase for consistency
+            if (coin) {
+                coin = coin.toUpperCase();
+            }
+            
+            logger.info('Processing signal:', signal);
             
             // Validate signal
-            if (!['buy', 'sell'].includes(action)) {
-                logger.error('Invalid action:', action);
-                return { success: false, error: 'Invalid action' };
+            if (!action || !['buy', 'sell'].includes(action)) {
+                logger.error('Invalid or missing action:', action);
+                return { success: false, error: 'Invalid or missing action' };
+            }
+            
+            if (!symbol || !coin) {
+                logger.error('Missing coin or symbol:', { symbol, coin });
+                return { success: false, error: 'Missing coin or symbol information' };
             }
 
-            // Check Redis database for buy/sell eligibility
-            const canBuy = await this.database.canBuy(config.TRADING_COIN);
-            const canSell = await this.database.canSell(config.TRADING_COIN);
+            // Check Redis database for buy/sell eligibility using strategy reference
+            const canBuy = await this.database.canBuy(coin, category, subcategory);
+            const canSell = await this.database.canSell(coin, category, subcategory);
+            const strategyRef = this.database.getStrategyKey(coin, category, subcategory);
             
             if (action === 'buy' && !canBuy) {
-                logger.warn(`Cannot buy ${config.TRADING_COIN} - already have active position`);
-                return { success: false, error: `Already have active ${config.TRADING_COIN} position` };
+                logger.warn(`Cannot buy ${coin} - already have active position for strategy: ${strategyRef}`);
+                return { success: false, error: `Already have active position for strategy: ${strategyRef}` };
             }
             
             if (action === 'sell' && !canSell) {
-                logger.warn(`Cannot sell ${config.TRADING_COIN} - no active position to sell`);
-                return { success: false, error: `No active ${config.TRADING_COIN} position to sell` };
+                logger.warn(`Cannot sell ${coin} - no active position for strategy: ${strategyRef}`);
+                return { success: false, error: `No active position to sell for strategy: ${strategyRef}` };
             }
 
             // Check cooldown
@@ -501,90 +655,136 @@ class SignalManager {
                 return { success: false, error: 'Daily trade limit reached' };
             }
 
-            // Get account balance (just to verify connection, no minimum check needed)
+            // Get account balance
             const balance = await this.okxClient.getBalance('USDT');
 
-            // Calculate position size
+            // Calculate position size based on recurring mode
             let positionSize;
             let tradingAmount;
             
             if (action === 'buy') {
-                // Get available trading balance (from previous sell or initial amount)
-                tradingAmount = await this.database.getTradingBalance(config.TRADING_COIN);
-                
-                if (!balance || balance.available < tradingAmount) {
-                    logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
-                    return { success: false, error: 'Insufficient USDT balance for trade' };
+                if (recurringMode === 'qu' && amount) {
+                    // Quantity mode (Qu): Use fixed USDT amount for buying
+                    tradingAmount = amount;
+                    if (!balance || balance.available < tradingAmount) {
+                        logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
+                        return { success: false, error: 'Insufficient USDT balance for trade' };
+                    }
+                    positionSize = tradingAmount.toString();
+                    logger.info(`Buy mode (Qu): Fixed amount ${tradingAmount} USDT`);
+                } else {
+                    // Amount mode (Am): Check if this is the first trade for this strategy
+                    const isFirstTrade = await this.database.isFirstTrade(coin, category, subcategory);
+                    
+                    if (isFirstTrade && amount) {
+                        // First trade: use amount from signal
+                        tradingAmount = amount;
+                        logger.info(`Buy mode (Am): First trade with ${tradingAmount} USDT from signal - Strategy: ${strategyRef}`);
+                    } else {
+                        // Subsequent buys: use stored balance from previous sell
+                        tradingAmount = await this.database.getTradingBalance(coin, category, subcategory);
+                        logger.info(`Buy mode (Am): Using ${tradingAmount} USDT from previous sell proceeds - Strategy: ${strategyRef}`);
+                    }
+                    
+                    if (!balance || balance.available < tradingAmount) {
+                        logger.error(`Insufficient USDT balance. Need ${tradingAmount}, have ${balance?.available || 0}`);
+                        return { success: false, error: 'Insufficient USDT balance for trade' };
+                    }
+                    positionSize = tradingAmount.toString();
                 }
-                positionSize = tradingAmount.toString();
-                logger.info(`Using ${tradingAmount} USDT for buy order`);
             } else {
-                // For sell, get the quantity from Redis (what we bought)
-                const buyPosition = await this.database.getBuyPosition(config.TRADING_COIN);
-                if (!buyPosition) {
-                    logger.warn(`No buy position found in database for ${config.TRADING_COIN}`);
-                    return { success: false, error: `No buy position to sell` };
+                // Sell logic
+                const buyPosition = await this.database.getBuyPosition(coin, category, subcategory);
+                
+                // For Am mode, check if it's the first trade and prevent sell
+                if (recurringMode === 'am') {
+                    const isFirstTrade = await this.database.isFirstTrade(coin, category, subcategory);
+                    if (isFirstTrade) {
+                        logger.warn(`Cannot sell on first trade for Am mode - Strategy: ${strategyRef}`);
+                        return { success: false, error: `Cannot sell on first trade for Am mode. Must buy first - Strategy: ${strategyRef}` };
+                    }
                 }
                 
-                // Sell the exact quantity we bought
+                if (!buyPosition) {
+                    logger.warn(`No buy position found for strategy: ${strategyRef}`);
+                    return { success: false, error: `No buy position to sell for strategy: ${strategyRef}` };
+                }
+                
+                // Both Qu and Am modes: sell the quantity that was bought
                 positionSize = buyPosition.quantity.toString();
-                logger.info(`Selling ${positionSize} ${config.TRADING_COIN}`);
+                logger.info(`Sell mode: Selling ${positionSize} ${coin} (strategy: ${strategyRef})`);
             }
 
-            // Place order with stop loss and take profit
-            const order = await this.okxClient.placeOrderWithSLTP(
-                symbol,
-                action,
-                positionSize,
-                config.STOP_LOSS_PERCENTAGE,
-                config.TAKE_PROFIT_PERCENTAGE
-            );
+            // Place order based on order type
+            let order;
+            if (orderType === 'limit' && price) {
+                order = await this.okxClient.placeLimitOrder(symbol, action, positionSize, price);
+            } else {
+                order = await this.okxClient.placeMarketOrder(symbol, action, positionSize);
+            }
 
             if (order) {
                 this.setCooldown(symbol, action);
-                this.lastAction = action; // Remember this action
                 
                 // Update Redis database
                 if (action === 'buy') {
                     // Get ticker to store the purchase price
                     const ticker = await this.okxClient.getTicker(symbol);
-                    const purchasePrice = ticker ? ticker.last : 0;
+                    const purchasePrice = ticker ? ticker.last : (price || 0);
                     
-                    // Calculate quantity bought (approximate, since we're using USDT amount)
-                    const quantityBought = purchasePrice > 0 ? (parseFloat(positionSize) / purchasePrice) : 0;
+                    // Calculate quantity bought based on USDT amount spent
+                    const amountSpent = tradingAmount;
+                    const quantityBought = purchasePrice > 0 ? (amountSpent / purchasePrice) : 0;
                     
                     await this.database.storeBuyOrder(
-                        config.TRADING_COIN,
+                        coin,
+                        category,
+                        subcategory,
                         quantityBought,
                         purchasePrice,
-                        tradingAmount,
+                        amountSpent,
                         order.ordId,
                         new Date().toISOString()
                     );
+                    
+                    logger.info(`Stored buy: ${quantityBought} ${coin} for ${amountSpent} USDT (strategy: ${strategyRef})`);
                 } else {
                     // Calculate proceeds from sell
                     const ticker = await this.okxClient.getTicker(symbol);
-                    const currentPrice = ticker ? ticker.last : 0;
+                    const currentPrice = ticker ? ticker.last : (price || 0);
                     const soldQuantity = parseFloat(positionSize);
                     const sellProceeds = currentPrice * soldQuantity;
                     
-                    // Store new trading balance for next buy
-                    await this.database.storeTradingBalance(config.TRADING_COIN, sellProceeds);
+                    // Store new trading balance for next buy based on recurring mode
+                    if (recurringMode === 'am') {
+                        // Amount mode: store sell proceeds for next buy
+                        await this.database.storeTradingBalance(coin, category, subcategory, sellProceeds);
+                        logger.info(`Sell proceeds: ${sellProceeds.toFixed(2)} USDT (will be used for next buy) - Strategy: ${strategyRef}`);
+                    } else if (recurringMode === 'qu') {
+                        // Quantity mode: store the original amount that was used for buying
+                        const buyPosition = await this.database.getBuyPosition(coin, category, subcategory);
+                        if (buyPosition) {
+                            await this.database.storeTradingBalance(coin, category, subcategory, buyPosition.usdtSpent);
+                            logger.info(`Quantity mode: Will use original amount ${buyPosition.usdtSpent} USDT for next buy - Strategy: ${strategyRef}`);
+                        }
+                    }
                     
                     // Clear buy position after selling
-                    await this.database.clearBuyPosition(config.TRADING_COIN);
-                    
-                    logger.info(`Sell proceeds: ${sellProceeds.toFixed(2)} USDT (will be used for next buy)`);
+                    await this.database.clearBuyPosition(coin, category, subcategory);
                 }
                 
-                logger.info(`✅ Order executed: ${action} ${positionSize} ${symbol}`);
+                logger.info(`✅ Order executed: ${action} ${positionSize} ${symbol} (${orderType})`);
                 return { 
                     success: true, 
                     order: order,
                     details: {
                         action,
                         symbol,
+                        coin,
                         amount: positionSize,
+                        orderType,
+                        price: price || 'market',
+                        recurringMode,
                         timestamp: new Date().toISOString()
                     }
                 };
@@ -638,10 +838,16 @@ app.post('/webhook', async (req, res) => {
         let signal;
         if (typeof req.body === 'string') {
             try {
+                // Try to parse as JSON first
                 signal = JSON.parse(req.body);
             } catch {
-                // If not JSON, treat as simple text command
-                signal = { action: req.body.toLowerCase().trim() };
+                // If not JSON, try to parse as TradingView format
+                try {
+                    signal = TradingViewParser.parseMessage(req.body);
+                } catch (parseError) {
+                    // If TradingView parsing fails, treat as simple text command
+                    signal = { action: req.body.toLowerCase().trim() };
+                }
             }
         } else {
             signal = req.body;
@@ -763,16 +969,30 @@ app.get('/account', async (req, res) => {
     }
 });
 
-// Get current position from Redis
-app.get('/position', async (req, res) => {
+// Get current position from Redis by strategy
+app.get('/position/:coin/:category/:subcategory', async (req, res) => {
     try {
-        const buyPosition = await signalManager.database.getBuyPosition(config.TRADING_COIN);
-        const canBuy = await signalManager.database.canBuy(config.TRADING_COIN);
-        const canSell = await signalManager.database.canSell(config.TRADING_COIN);
-        const tradingBalance = await signalManager.database.getTradingBalance(config.TRADING_COIN);
+        const coin = req.params.coin?.toUpperCase();
+        const category = req.params.category;
+        const subcategory = req.params.subcategory;
+        
+        if (!coin || !category || !subcategory) {
+            return res.status(400).json({ 
+                error: 'Missing required parameters: coin, category, subcategory' 
+            });
+        }
+        
+        const buyPosition = await signalManager.database.getBuyPosition(coin, category, subcategory);
+        const canBuy = await signalManager.database.canBuy(coin, category, subcategory);
+        const canSell = await signalManager.database.canSell(coin, category, subcategory);
+        const tradingBalance = await signalManager.database.getTradingBalance(coin, category, subcategory);
+        const strategyRef = signalManager.database.getStrategyKey(coin, category, subcategory);
         
         res.json({
-            coin: config.TRADING_COIN,
+            strategyRef: strategyRef,
+            coin: coin,
+            category: category,
+            subcategory: subcategory,
             buyPosition,
             canBuy,
             canSell,
