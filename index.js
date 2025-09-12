@@ -35,7 +35,7 @@ const config = {
     COOLDOWN_SECONDS: 60, // Prevent duplicate signals
     
     // Risk Management
-    MAX_DAILY_TRADES: 500,
+    MAX_DAILY_TRADES: 5000,
     MIN_BALANCE_USDT: 50,
     
     // Redis Settings
