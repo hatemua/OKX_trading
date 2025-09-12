@@ -606,8 +606,8 @@ class SignalManager {
     }
 
     // Check if signal is in cooldown
-    isInCooldown(symbol, action) {
-        const key = `${symbol}-${action}`;
+    isInCooldown(symbol, action, subcategory = null) {
+        const key = subcategory ? `${symbol}-${action}-${subcategory}` : `${symbol}-${action}`;
         const lastSignal = this.cooldowns.get(key);
         
         if (!lastSignal) return false;
@@ -617,8 +617,8 @@ class SignalManager {
     }
 
     // Set cooldown for signal
-    setCooldown(symbol, action) {
-        const key = `${symbol}-${action}`;
+    setCooldown(symbol, action, subcategory = null) {
+        const key = subcategory ? `${symbol}-${action}-${subcategory}` : `${symbol}-${action}`;
         this.cooldowns.set(key, Date.now());
     }
 
@@ -732,8 +732,8 @@ class SignalManager {
             }
 
             // Check cooldown
-            if (this.isInCooldown(symbol, action)) {
-                logger.warn(`Signal in cooldown: ${symbol} ${action}`);
+            if (this.isInCooldown(symbol, action, subcategory)) {
+                logger.warn(`Signal in cooldown: ${symbol} ${action} ${subcategory || 'no-subcategory'}`);
                 return { success: false, error: 'Signal in cooldown period' };
             }
 
@@ -834,7 +834,7 @@ class SignalManager {
             }
 
             if (order) {
-                this.setCooldown(symbol, action);
+                this.setCooldown(symbol, action, subcategory);
                 
                 // Update Redis database
                 if (action === 'buy') {
