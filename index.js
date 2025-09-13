@@ -1,5 +1,6 @@
 // server.js
 const express = require('express');
+const cors = require('cors');
 const crypto = require('crypto');
 const axios = require('axios');
 const dotenv = require('dotenv');
@@ -1085,6 +1086,20 @@ class SignalManager {
 
 // === EXPRESS SERVER ===
 const app = express();
+
+// Configure CORS to allow dashboard access
+app.use(cors({
+    origin: [
+        'http://localhost:3000',
+        'http://localhost:3001',
+        'http://127.0.0.1:3000',
+        'http://127.0.0.1:3001'
+    ],
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true
+}));
+
 app.use(express.json());
 app.use(express.text());
 
