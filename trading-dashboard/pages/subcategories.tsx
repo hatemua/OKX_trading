@@ -32,14 +32,15 @@ const SubcategoriesPage: React.FC = () => {
     ? rankings 
     : rankings.filter(r => r.coin === selectedCoin);
 
-  const uniqueCoins = [...new Set(rankings.map(r => r.coin))];
+  const uniqueCoins = Array.from(new Set(rankings.map(r => r.coin)));
 
   const chartData = filteredRankings.map(r => ({
     subcategory: r.subcategory,
     profit: r.total_profit_loss,
     winRate: r.win_rate,
     trades: r.total_trades,
-    coin: r.coin
+    coin: r.coin,
+    fill: r.total_profit_loss > 0 ? '#10b981' : '#ef4444'
   }));
 
   const pieData = filteredRankings.slice(0, 6).map((r, index) => ({
@@ -136,9 +137,12 @@ const SubcategoriesPage: React.FC = () => {
                   />
                   <Bar 
                     dataKey="profit" 
-                    fill={(entry) => entry > 0 ? '#10b981' : '#ef4444'}
                     name="Profit/Loss"
-                  />
+                  >
+                    {chartData.slice(0, 10).map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={entry.fill} />
+                    ))}
+                  </Bar>
                 </BarChart>
               </ResponsiveContainer>
             </div>
@@ -155,7 +159,7 @@ const SubcategoriesPage: React.FC = () => {
                     outerRadius={100}
                     fill="#8884d8"
                     dataKey="value"
-                    label={(entry) => `${entry.name}: $${entry.profit.toFixed(0)}`}
+                    label={({name, profit}: any) => `${name}: $${profit.toFixed(0)}`}
                   >
                     {pieData.map((entry, index) => (
                       <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />

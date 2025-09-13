@@ -3,7 +3,7 @@ import Layout from '@/components/Layout';
 import MetricCard from '@/components/MetricCard';
 import { api } from '@/lib/api';
 import { StrategyPerformance } from '@/types';
-import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
+import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Cell } from 'recharts';
 import { TrendingUp, DollarSign, Target, Activity } from 'lucide-react';
 
 const PerformancePage: React.FC = () => {
@@ -31,7 +31,7 @@ const PerformancePage: React.FC = () => {
     ? performance 
     : performance.filter(p => p.coin === selectedCoin);
 
-  const uniqueCoins = [...new Set(performance.map(p => p.coin))];
+  const uniqueCoins = Array.from(new Set(performance.map(p => p.coin)));
 
   // Aggregate metrics
   const totalProfit = filteredPerformance.reduce((sum, p) => sum + p.total_profit_loss, 0);
@@ -49,7 +49,8 @@ const PerformancePage: React.FC = () => {
       profit: p.total_profit_loss,
       volume: p.total_volume,
       winRate: p.win_rate,
-      trades: p.total_trades
+      trades: p.total_trades,
+      fill: p.total_profit_loss > 0 ? '#10b981' : '#ef4444'
     }));
 
   // Volume vs Profit scatter data
@@ -134,9 +135,12 @@ const PerformancePage: React.FC = () => {
                   />
                   <Bar 
                     dataKey="profit" 
-                    fill={(entry: any) => entry.profit > 0 ? '#10b981' : '#ef4444'}
                     name="Profit/Loss"
-                  />
+                  >
+                    {profitChartData.slice(0, 15).map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={entry.fill} />
+                    ))}
+                  </Bar>
                 </BarChart>
               </ResponsiveContainer>
             </div>

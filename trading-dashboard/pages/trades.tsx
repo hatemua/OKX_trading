@@ -122,8 +122,8 @@ const TradesPage: React.FC = () => {
     window.URL.revokeObjectURL(url);
   };
 
-  const uniqueCoins = [...new Set(trades.map(t => t.coin))];
-  const uniqueSubcategories = [...new Set(trades.map(t => t.subcategory))];
+  const uniqueCoins = Array.from(new Set(trades.map(t => t.coin)));
+  const uniqueSubcategories = Array.from(new Set(trades.map(t => t.subcategory)));
 
   const totalProfit = filteredTrades.reduce((sum, t) => sum + (t.profit_loss || 0), 0);
   const profitableTrades = filteredTrades.filter(t => (t.profit_loss || 0) > 0);
