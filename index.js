@@ -5,6 +5,7 @@ const axios = require('axios');
 const dotenv = require('dotenv');
 const winston = require('winston');
 const redis = require('redis');
+const SupabaseClient = require('./supabase-client');
 
 dotenv.config();
 
@@ -459,6 +460,145 @@ class OKXClient {
         }
     }
 
+    // Get comprehensive trade history from OKX
+    async getTradeHistory(options = {}) {
+        try {
+            const {
+                symbol = null,
+                limit = 100,
+                after = null,
+                before = null,
+                begin = null,
+                end = null
+            } = options;
+
+            const params = {
+                instType: 'SPOT'
+            };
+            
+            if (symbol) {
+                params.instId = symbol;
+            }
+            
+            if (limit && limit <= 100) {
+                params.limit = limit.toString();
+            }
+
+            // Pagination parameters
+            if (after) {
+                params.after = after;
+            }
+            if (before) {
+                params.before = before;
+            }
+
+            // Time range parameters (timestamps in milliseconds)
+            if (begin) {
+                params.begin = begin.toString();
+            }
+            if (end) {
+                params.end = end.toString();
+            }
+
+            const result = await this.request('GET', '/api/v5/trade/fills-history', params);
+            
+            if (result.code === '0') {
+                return result.data || [];
+            }
+            
+            logger.warn(`OKX API returned code: ${result.code}, message: ${result.msg}`);
+            return [];
+        } catch (error) {
+            logger.error('Error getting trade history:', error);
+            return [];
+        }
+    }
+
+    // Get all recent trade history with pagination
+    async getAllRecentTradeHistory(symbol = null, days = 30, maxTrades = 1000) {
+        try {
+            const allTrades = [];
+            const endTime = Date.now();
+            const startTime = endTime - (days * 24 * 60 * 60 * 1000); // X days ago
+            let after = null;
+            let iterations = 0;
+            const maxIterations = Math.ceil(maxTrades / 100); // Prevent infinite loops
+
+            logger.info(`Fetching trade history for ${symbol || 'all symbols'} from last ${days} days...`);
+
+            while (iterations < maxIterations) {
+                const options = {
+                    symbol,
+                    limit: 100,
+                    begin: startTime,
+                    end: endTime
+                };
+
+                if (after) {
+                    options.after = after;
+                }
+
+                const trades = await this.getTradeHistory(options);
+                
+                if (!trades || trades.length === 0) {
+                    logger.info(`No more trades found. Total fetched: ${allTrades.length}`);
+                    break;
+                }
+
+                allTrades.push(...trades);
+                
+                // Set pagination cursor for next request
+                after = trades[trades.length - 1].billId;
+                
+                logger.info(`Fetched ${trades.length} trades, total: ${allTrades.length}`);
+                
+                // If we got less than the limit, we've reached the end
+                if (trades.length < 100) {
+                    break;
+                }
+
+                iterations++;
+                
+                // Rate limiting - wait 100ms between requests
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+
+            logger.info(`Successfully fetched ${allTrades.length} trades from OKX history`);
+            return allTrades;
+
+        } catch (error) {
+            logger.error('Error getting all trade history:', error);
+            return [];
+        }
+    }
+
+    // Get order history (different from fills)
+    async getOrderHistory(symbol = null, limit = 100) {
+        try {
+            const params = {
+                instType: 'SPOT'
+            };
+            
+            if (symbol) {
+                params.instId = symbol;
+            }
+            
+            if (limit) {
+                params.limit = limit.toString();
+            }
+
+            const result = await this.request('GET', '/api/v5/trade/orders-history-archive', params);
+            
+            if (result.code === '0') {
+                return result.data || [];
+            }
+            return [];
+        } catch (error) {
+            logger.error('Error getting order history:', error);
+            return [];
+        }
+    }
+
     // Validate if symbol exists on OKX
     async validateSymbol(symbol) {
         try {
@@ -592,13 +732,14 @@ class SignalManager {
         this.dailyTrades = new Map();
         this.lastAction = null; // Track last executed action
         this.okxClient = new OKXClient();
-        this.database = new TradeDatabase();
+        this.database = new TradeDatabase(); // Keep Redis for temporary caching
+        this.supabase = new SupabaseClient(); // Add Supabase for permanent storage
     }
 
     async initialize() {
         try {
             await this.database.connect();
-            logger.info('SignalManager initialized with Redis database');
+            logger.info('SignalManager initialized with Redis database and Supabase');
         } catch (error) {
             logger.error('Failed to initialize SignalManager:', error);
             throw error;
@@ -716,10 +857,11 @@ class SignalManager {
                 return { success: false, error: `Symbol ${symbol} not available on OKX` };
             }
 
-            // Check Redis database for buy/sell eligibility using strategy reference
-            const canBuy = await this.database.canBuy(coin, category, subcategory);
-            const canSell = await this.database.canSell(coin, category, subcategory);
-            const strategyRef = this.database.getStrategyKey(coin, category, subcategory);
+            // Check database for buy/sell eligibility using strategy reference
+            // Use Supabase for accurate position tracking, fallback to Redis for legacy compatibility
+            const canBuy = await this.supabase.canBuy(coin, category, subcategory);
+            const canSell = await this.supabase.canSell(coin, category, subcategory);
+            const strategyRef = `${coin}:${category}:${subcategory}`;
             
             if (action === 'buy' && !canBuy) {
                 logger.warn(`Cannot buy ${coin} - already have active position for strategy: ${strategyRef}`);
@@ -835,6 +977,30 @@ class SignalManager {
 
             if (order) {
                 this.setCooldown(symbol, action, subcategory);
+                
+                // Store trade in Supabase for permanent analytics
+                const ticker = await this.okxClient.getTicker(symbol);
+                const executionPrice = ticker ? ticker.last : (price || 0);
+                const quantity = parseFloat(positionSize);
+                const totalValue = executionPrice * quantity;
+                
+                await this.supabase.storeTrade({
+                    okxOrderId: order.ordId,
+                    symbol,
+                    coin,
+                    action,
+                    orderType,
+                    quantity,
+                    price: executionPrice,
+                    totalValue,
+                    category: category || 'unknown',
+                    subcategory: subcategory || 'unknown',
+                    recurringMode,
+                    executedAt: new Date().toISOString(),
+                    status: 'filled',
+                    initialAmount,
+                    initialQuantity
+                });
                 
                 // Update Redis database
                 if (action === 'buy') {
@@ -1147,6 +1313,240 @@ app.get('/position/:coin/:category/:subcategory', async (req, res) => {
             tradingBalance: `${tradingBalance} USDT`,
             timestamp: new Date().toISOString()
         });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Import OKX trade history into Supabase
+app.post('/import-history', async (req, res) => {
+    try {
+        const { symbol, days = 30, maxTrades = 1000 } = req.body;
+        
+        logger.info(`Importing comprehensive trade history for ${symbol || 'all symbols'} (last ${days} days, max ${maxTrades} trades)`);
+        
+        // Fetch comprehensive trade history from OKX
+        const okxClient = new OKXClient();
+        const tradeHistory = await okxClient.getAllRecentTradeHistory(symbol, days, maxTrades);
+        
+        if (tradeHistory.length === 0) {
+            return res.json({
+                success: true,
+                message: 'No trade history found',
+                imported: 0,
+                details: `No trades found for ${symbol || 'all symbols'} in the last ${days} days`
+            });
+        }
+        
+        logger.info(`Fetched ${tradeHistory.length} trades from OKX, now importing to Supabase...`);
+        
+        // Import to Supabase
+        const result = await signalManager.supabase.importOKXTradeHistory(tradeHistory);
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                message: `Successfully imported ${result.data.length} trades from OKX history`,
+                imported: result.data.length,
+                totalFetched: tradeHistory.length,
+                timeRange: `${days} days`,
+                symbol: symbol || 'all symbols',
+                summary: {
+                    totalTrades: result.data.length,
+                    uniqueSymbols: [...new Set(result.data.map(t => t.symbol))].length,
+                    dateRange: tradeHistory.length > 0 ? {
+                        from: new Date(Math.min(...tradeHistory.map(t => parseInt(t.ts)))).toISOString(),
+                        to: new Date(Math.max(...tradeHistory.map(t => parseInt(t.ts)))).toISOString()
+                    } : null
+                }
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error,
+                fetchedCount: tradeHistory.length
+            });
+        }
+    } catch (error) {
+        logger.error('Import history error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            details: error.message
+        });
+    }
+});
+
+// Get OKX trade history preview (without importing to Supabase)
+app.post('/okx-history-preview', async (req, res) => {
+    try {
+        const { symbol, days = 7, maxTrades = 100 } = req.body;
+        
+        logger.info(`Previewing OKX trade history for ${symbol || 'all symbols'} (last ${days} days)`);
+        
+        const okxClient = new OKXClient();
+        const tradeHistory = await okxClient.getAllRecentTradeHistory(symbol, days, maxTrades);
+        
+        if (tradeHistory.length === 0) {
+            return res.json({
+                success: true,
+                message: 'No trade history found',
+                trades: [],
+                count: 0
+            });
+        }
+        
+        // Process and format trades for preview
+        const formattedTrades = tradeHistory.map(trade => ({
+            tradeId: trade.tradeId,
+            orderId: trade.ordId,
+            symbol: trade.instId,
+            side: trade.side,
+            fillSz: parseFloat(trade.fillSz),
+            fillPx: parseFloat(trade.fillPx),
+            fillPxVol: parseFloat(trade.fillPxVol || trade.fillSz * trade.fillPx),
+            fee: parseFloat(trade.fee),
+            feeCcy: trade.feeCcy,
+            ts: new Date(parseInt(trade.ts)).toISOString(),
+            rawTimestamp: trade.ts
+        }));
+        
+        res.json({
+            success: true,
+            message: `Found ${formattedTrades.length} trades`,
+            trades: formattedTrades,
+            count: formattedTrades.length,
+            summary: {
+                symbols: [...new Set(formattedTrades.map(t => t.symbol))],
+                dateRange: {
+                    from: new Date(Math.min(...tradeHistory.map(t => parseInt(t.ts)))).toISOString(),
+                    to: new Date(Math.max(...tradeHistory.map(t => parseInt(t.ts)))).toISOString()
+                },
+                totalVolume: formattedTrades.reduce((sum, t) => sum + (t.fillSz * t.fillPx), 0),
+                buys: formattedTrades.filter(t => t.side === 'buy').length,
+                sells: formattedTrades.filter(t => t.side === 'sell').length
+            }
+        });
+    } catch (error) {
+        logger.error('Preview OKX history error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            details: error.message
+        });
+    }
+});
+
+// Get strategy performance analytics
+app.get('/analytics/performance', async (req, res) => {
+    try {
+        const { coin, subcategory } = req.query;
+        const result = await signalManager.supabase.getStrategyPerformance(coin, subcategory);
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                data: result.data
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get best performing subcategories
+app.get('/analytics/best-subcategories', async (req, res) => {
+    try {
+        const { limit = 10 } = req.query;
+        const result = await signalManager.supabase.getBestSubcategories(parseInt(limit));
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                data: result.data
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get recent trades from Supabase
+app.get('/analytics/recent-trades', async (req, res) => {
+    try {
+        const { limit = 50 } = req.query;
+        const result = await signalManager.supabase.getRecentTrades(parseInt(limit));
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                data: result.data
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get trading analytics
+app.get('/analytics/trading', async (req, res) => {
+    try {
+        const { days = 30 } = req.query;
+        const result = await signalManager.supabase.getTradingAnalytics(parseInt(days));
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                data: result.data
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get trades by strategy
+app.get('/analytics/trades/:coin/:category/:subcategory', async (req, res) => {
+    try {
+        const { coin, category, subcategory } = req.params;
+        const result = await signalManager.supabase.getTradesByStrategy(
+            coin.toUpperCase(), 
+            category, 
+            subcategory
+        );
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                data: result.data,
+                strategy: `${coin}:${category}:${subcategory}`
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
